@@ -7,6 +7,11 @@ import asyncio
 from . import types as t
 from . import walking
 
+# this works
+# see ./fuse-passthrough.py
+# see ./fuse3.py
+# TODO mmap
+
 # FUSE Implementation
 class FS(Operations):
 
@@ -20,16 +25,16 @@ class FS(Operations):
         return asyncio.run(coro)
 
     def getattr(self, path, fh=None):
-        thing = self.wait_async(walking.walk_path)(self.folder, path.lstrip('/'))
+        folder, fname = self.wait_async(walking.walk_path)(self.folder, t.MyPath(path))
 
-        if thing == None:
+        if folder == None:
             # print(f"path {path} not found")
             raise FuseOSError(errno.ENOENT)
 
         st = dict()
-        if isinstance(thing, t.File):
+        if fname != None:
             st['st_mode'] = stat.S_IFREG | 0o444
-            st['st_size'] = self.wait_async(thing.size_bytes_exact)()
+            st['st_size'] = self.wait_async(folder.file_size_bytes_exact)(fname)
             print(f"got size {st['st_size']}")
             # print(f"file size: {st['st_size']}")
         else:
@@ -44,25 +49,29 @@ class FS(Operations):
     def readdir(self, path, fh):
         # print(f"readdir {path}")
 
-        async def fof(path):
-            folder = await walking.walk_path_find_folder(self.folder, path.lstrip('/'))
+        async def fof(path: t.MyPath):
+            folder = await walking.walk_path_find_folder(self.folder, path)
+            if folder == None:
+                raise FuseOSError(errno.ENOENT) # should never happen
             return await folder.folders_and_files()
 
-        folders, files = self.wait_async(fof)(path)
+        folders, files = self.wait_async(fof)(t.MyPath(path))
         # if not isinstance(thing, t.Folder):
         #     # print("thing = None 1")
         #     raise FuseOSError(errno.ENOENT) # should never happen
-        n = [".", "..", *folders.keys(), *files.keys()]
+        n = [".", "..", *folders.keys(), *files]
         return n
 
     def read(self, path, size, offset, fh):
-        thing = self.wait_async(walking.walk_path)(self.folder, path)
-        if (isinstance(thing, t.File)):
-            # return self.wait_async(thing.bytes)(offset, size)
-            cache_path = self.wait_async(thing.cache_path)()
-            with open(cache_path, "rb") as f:
-                f.seek(offset)
-                return f.read(size)
+        print(f"read {path}")
+        folder, fname = self.wait_async(walking.walk_path)(self.folder, t.MyPath(path))
+        assert fname != None
+
+        # return self.wait_async(thing.bytes)(offset, size)
+        cache_path = self.wait_async(folder.file_cache_path)(fname)
+        with open(cache_path, "rb") as f:
+            f.seek(offset)
+            return f.read(size)
 
         raise FuseOSError(errno.ENOENT)
 

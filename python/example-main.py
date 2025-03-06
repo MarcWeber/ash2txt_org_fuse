@@ -8,7 +8,8 @@ import pickle
 from time import time
 import aiohttp
 import asyncio
-from filesystems import walking, ash2txtorg_cached, fuse
+from filesystems import walking, ash2txtorg_cached
+from filesystems.types import MyPath
 from threading import Thread, Event
 
 import nest_asyncio
@@ -73,11 +74,14 @@ def main():
     print(f"""
     usage:
     export FUSE_LIBRARY_PATH=/nix/store/czxy0x8wrklqswmkg75cncphj9cq893p-fuse-2.9.9/lib/libfuse.so.2
-    {app} <CACHE_DIR> <URL> mount <PATH> <MOUNT_POINT>
+    {app} <CACHE_DIR> <URL> fuse-mount <PATH> <MOUNT_POINT>
+    {app} <CACHE_DIR> <URL> fuse_passthrough-mount <PATH> <MOUNT_POINT>
+    {app} <CACHE_DIR> <URL> fuse3-mount <PATH> <MOUNT_POINT>
     {app} <CACHE_DIR> <URL> list <PATH>
-    {app} <CACHE_DIR> <URL> list-recursive <PATH>
     {app} <CACHE_DIR> <URL> prefetch <PATH>
     {app} <CACHE_DIR> <URL> du_approximate <PATH>
+    {app} <CACHE_DIR> <URL> cache_dir_check_sizes <PATH>
+    {app} <CACHE_DIR> <URL> list_special_and_approximate_size_fast <PATH>
     """)
     cache_directory = Path(sys.argv[1])
     root_url        = sys.argv[2]
@@ -141,19 +145,20 @@ def main():
                  finally:
                     del fetching[m]
 
-        async def folder_fetch(folder: str):
+        async def folder_fetch(folder: MyPath):
             nonlocal cache_directory
-            f = cache_directory / folder
+            f = cache_directory / str(folder)
             f.mkdir(exist_ok=True, parents=True)
             cache_file = f / ".directory_contents_cached_v2.pickled"
-            def store_data(data):
+            async def store_data(data):
                 tmp = cache_file.with_suffix('.tmp')
                 with tmp.open('wb') as f:
                     pickle.dump(data, f)
                 tmp.rename(cache_file)
 
             async def frech_fetch():
-                url = build_url(root_url, folder)
+                print(f"frech_fetch ")
+                url = build_url(root_url, str(folder))
                 async def fetch():
                     html = await fetch_text(url)
                     parsed = ash2txtorg_cached.parse_directory_html(html)
@@ -173,7 +178,6 @@ def main():
                 store = ash2txtorg_cached.AutoStore(loop, data, store_data)
             elif (cache_file_v1.exists()):
                 # reuse previous data I already fetched (legacy)
-                print(f"unpickling v1 {cache_file_v1} for {folder}")
                 # hack handling of my own fetched data
                 @dataclass
                 class WalkFile:
@@ -204,15 +208,15 @@ def main():
                 store = await frech_fetch()
             return store
 
-        async def file_fetch_size(folder: str, name: str):
+        async def file_fetch_size(folder: MyPath, name: str):
             headers = await fetch_headers(build_url(root_url, folder, name))
             return int(headers['Content-Length'])
 
         fetch_once = LimitByKey(loop)
 
-        async def file_ensure_fetched(folder: str, name: str):
+        async def file_ensure_fetched(folder: MyPath, name: str):
             # TODO .. only start this once for large files !
-            file = cache_directory / folder / name
+            file = cache_directory / str(folder) / name
             if not file.exists():
                 async def fetch():
                     tmp = file.with_suffix(".tmp")
@@ -223,13 +227,13 @@ def main():
                     tmp.rename(file)
                 return await fetch_once.by_key(file, fetch)
 
-        async def file_cache_path(folder: str, name: str):
+        async def file_cache_path(folder: MyPath, name: str):
             await file_ensure_fetched(folder, name)
-            return cache_directory / folder / name
+            return cache_directory / str(folder) / name
 
-        async def file_bytes(folder: str, name: str, offset: int, size: int):
+        async def file_bytes(folder: MyPath, name: str, offset: int, size: int):
             await file_ensure_fetched(folder, name)
-            file = cache_directory / folder / name
+            file = cache_directory / str(folder) / name
             with file.open("rb") as f:
                     f.seek(offset)
                     return f.read(size)
@@ -240,41 +244,62 @@ def main():
                 file_fetch_size = file_fetch_size,
                 file_ensure_fetched = file_ensure_fetched,
                 file_bytes = file_bytes,
-                file_cache_path= file_cache_path
+                file_cache_path = file_cache_path
             )
-        folder = ash2txtorg_cached.LazyFolder("", lfo)
+        folder = ash2txtorg_cached.LazyFolder(MyPath(""), lfo)
         return folder
 
-    if argv[0] == "mount":
+    if argv[0] == "fuse-mount":
+        from filesystems import fuse
         path = argv[1]
         mountpoint = argv[2]
         print(f" {path} mountpoint={mountpoint}")
         # TODO multi threading ..
         folder = get_folder(cache_directory, root_url)
-        folder = wait_async(walking.walk_path_find_folder)(folder, path)
+        folder = wait_async(walking.walk_path_find_folder)(folder, MyPath(path))
+        assert folder
         fuse.mount(folder, mountpoint, wait_async)
+
+    if argv[0] == "fuse_passthrough-mount":
+        from filesystems import fuse_passthrough
+        path = argv[1]
+        mountpoint = argv[2]
+        print(f" {path} mountpoint={mountpoint}")
+        # TODO multi threading ..
+        folder = get_folder(cache_directory, root_url)
+        folder = wait_async(walking.walk_path_find_folder)(folder, MyPath(path))
+        assert folder
+        fuse_passthrough.mount(folder, mountpoint, wait_async)
+
+
+    if argv[0] == "fuse3-mount":
+        from filesystems import fuse3
+        print("WARNING UNFINISHED!")
+        path = argv[1]
+        mountpoint = argv[2]
+        print(f" {path} mountpoint={mountpoint}")
+        # TODO multi threading ..
+        folder = get_folder(cache_directory, root_url)
+        folder = wait_async(walking.walk_path_find_folder)(folder, MyPath(path))
+        assert folder
+        fuse3.mount(folder, mountpoint, wait_async)
+
 
     elif argv[0] == "list":
         path = argv[1]
         async def list_():
             folder = get_folder(cache_directory, root_url)
-            folder = await walking.walk_path_find_folder(folder, path)
-            print(await walking.folder_info(folder))
-        wait_async(list_)()
-
-    elif argv[0] == "list-recursive":
-        path = argv[1]
-        async def list_():
-            folder = get_folder(cache_directory, root_url)
-            folder = await walking.walk_path_find_folder(folder, path)
-            await walking.list_important(folder)
+            fof = await walking.walk_path(folder, MyPath(path))
+            assert folder
+            print(await walking.info(fof))
         wait_async(list_)()
 
     elif argv[0] == "prefetch":
         path = argv[1]
         async def prefetch():
             folder = get_folder(cache_directory, root_url)
-            folder = await walking.walk_path_find_folder(folder, path)
+            folder = await walking.walk_path_find_folder(folder, MyPath(path))
+            assert folder
             limiter = asyncio.Semaphore(120)
             await walking.prefetch(folder, limiter)
         wait_async(prefetch)()
@@ -284,9 +309,34 @@ def main():
         path = argv[1]
         async def du_approximate():
             folder = get_folder(cache_directory, root_url)
-            folder = await walking.walk_path_find_folder(folder, path)
+            folder = await walking.walk_path_find_folder(folder, MyPath(path))
+            assert folder
             await walking.list_and_size_approximate_fast_parallel(folder, limiter)
         wait_async(du_approximate)()
+
+    elif argv[0] == "cache_dir_check_sizes":
+        limiter = asyncio.Semaphore(50)
+        path = argv[1]
+        async def du_approximate():
+            folder = get_folder(cache_directory, root_url)
+            folder = await walking.walk_path_find_folder(folder, MyPath(path))
+            assert folder
+            await walking.walk_cache_dir_check_sizes(folder, cache_directory / path)
+        wait_async(du_approximate)()
+
+    elif argv[0] == "list_special_and_approximate_size_fast":
+        limiter = asyncio.Semaphore(50)
+        path = argv[1]
+        async def du_approximate():
+            folder = get_folder(cache_directory, root_url)
+            folder = await walking.walk_path_find_folder(folder, MyPath(path))
+            assert folder
+            lines = []
+            await walking.list_special_and_approximate_size_fast(lines, folder)
+            for l in lines:
+                print(l)
+        wait_async(du_approximate)()
+
 
     else:
         raise Exception(f"bad command {argv[0]}")

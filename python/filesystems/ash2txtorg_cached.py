@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from urllib.parse import unquote
 import asyncio
 from . import types as t
+from . import async_refreshable_weakref
 
 # FETCHING FOLDER AND FILE DETAILS FROM ASH2TXT.ORG
 @dataclass
@@ -78,21 +79,6 @@ class CachedFolderData:
 # CACHED FS IMPLEMENTATION
 
 
-class LazyFile(t.File):
-    def __init__(self, name: str, parent: "LazyFolder"):
-        self.name = name
-        self.parent = parent
-    async def size_bytes_approximate(self) -> int:
-        return await self.parent.file_size_bytes_approximate(self.name)
-    async def size_bytes_exact(self) -> int:
-        return await self.parent.file_size_bytes_exact(self.name)
-    async def bytes(self, offset, size):
-        return await self.parent.file_bytes(self.name, offset, size)
-    async def ensure_fetched(self):
-        return await self.parent.file_ensure_fetched(self.name)
-    async def cache_path(self):
-        return await self.parent.file_cache_path(self.name)
-
 T = TypeVar("T")  # Generic type for data
 
 class AutoStore(Generic[T]):
@@ -115,21 +101,28 @@ class AutoStore(Generic[T]):
 @dataclass
 class FolderOpts:
     loop: asyncio.AbstractEventLoop
-    folder_fetch:    Callable[[str], Awaitable[AutoStore[CachedFolderData]]]
-    file_fetch_size: Callable[[str, str], Awaitable[int]]
-    file_ensure_fetched: Callable[[str, str], Awaitable]
-    file_bytes: Callable[[str, str, int, int], Awaitable[bytes]]
-    file_cache_path: Callable[[str, str], Awaitable[str]]
+    folder_fetch:    Callable[[t.MyPath], Awaitable[AutoStore[CachedFolderData]]]
+    file_fetch_size: Callable[[t.MyPath, str], Awaitable[int]]
+    file_ensure_fetched: Callable[[t.MyPath, str], Awaitable]
+    file_bytes: Callable[[t.MyPath, str, int, int], Awaitable[bytes]]
+    file_cache_path: Callable[[t.MyPath, str], Awaitable[str]]
 
 
 class LazyFolder(t.Folder):
 
-    def __init__(self, path: str, opts: FolderOpts):
+    def __init__(self, path: t.MyPath, opts: FolderOpts):
         self.path = path
         self.opts = opts
         self.cache = None
         self.wait_size = {}
         self.ensure_fetched = {}
+        async def recreate():
+            c = await self.cached()
+            folders = {k: LazyFolder(self.path / k .lstrip('/'), self.opts)  for k in c.data.folders}
+            files   = c.data.files
+            return t.FoldersAndFilesDC(folders = folders, files = files)
+
+        self.faf = async_refreshable_weakref.AsyncRefreshableWeakRef(opts.loop, recreate = recreate)
 
     def cached(self):
         if not self.cache:
@@ -139,10 +132,8 @@ class LazyFolder(t.Folder):
         return self.cache
 
     async def folders_and_files(self) -> t.FoldersAndFiles:
-        c = await self.cached()
-        folders = {k: LazyFolder(f"{self.path}/{k}".lstrip('/'), self.opts)  for k in c.data.folders}
-        files   = {k: LazyFile(k, self) for k, v in c.data.files.items()}
-        return (folders, files)
+        x = await self.faf.get()
+        return x.folders, list(x.files.keys())
 
     async def file_size_bytes_approximate(self, name) -> int:
         c = await self.cached()
@@ -151,7 +142,7 @@ class LazyFolder(t.Folder):
             return file.size
         return file.size_approximate
 
-    async def file_size_bytes_exact(self, name) -> int:
+    async def file_size_bytes_exact(self, name: str) -> int:
         c = await self.cached()
         file = c.data.files[name]
         if  file.size != None:
@@ -176,3 +167,6 @@ class LazyFolder(t.Folder):
 
     def file_cache_path(self, name):
         return self.opts.file_cache_path(self.path, name)
+
+    async def file_exists(self, name: str) -> bool:
+        raise NotImplementedError()
