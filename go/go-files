@@ -1,0 +1,872 @@
+GO FILES
+
+filesystems/ash2txtorg.go
+package filesystems
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "net/url"
+    "os"
+    "path/filepath"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
+
+    "github.com/PuerkitoBio/goquery"
+)
+
+type CachedFileData struct {
+    Size           *int64
+    SizeApproximate int64
+}
+
+type CachedFolderData struct {
+    Files   map[string]CachedFileData
+    Folders []string
+}
+
+type FetchResultFile struct {
+    Size string
+    Date string
+}
+
+type FetchResultFolder struct {
+    Folders []string
+    Files   map[string]FetchResultFile
+}
+
+type LazyFile struct {
+    name   string
+    parent *LazyFolder
+}
+
+type LazyFolder struct {
+    path       string
+    cacheDir   string
+    rootURL    string
+    client     *http.Client
+    semaphore  chan struct{}
+    fetchOnce  map[string]chan struct{}
+    fetchMutex sync.Mutex
+    cache      *CachedFolderData
+    cacheMutex sync.RWMutex
+    wg         *sync.WaitGroup
+}
+
+func ExactSizeBytesFromStr(size string) *int64 {
+    if strings.HasSuffix(size, " B") {
+        if n, err := strconv.ParseInt(size[:len(size)-2], 10, 64); err == nil {
+            return &n
+        }
+    }
+    return nil
+}
+
+func ApproximateSizeBytesFromStr(size string) int64 {
+    parts := strings.Split(size, " ")
+    if len(parts) != 2 {
+        return 999999 // Fallback
+    }
+    n, _ := strconv.ParseFloat(parts[0], 64)
+    switch parts[1] {
+    case "B":
+        return int64(n)
+    case "KiB":
+        return int64(n * 1024)
+    case "MiB":
+        return int64(n * 1024 * 1024)
+    case "GiB":
+        return int64(n * 1024 * 1024 * 1024)
+    default:
+        return 999999
+    }
+}
+
+func ParseDirectoryHTML(html string) (*FetchResultFolder, error) {
+    doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+    if err != nil {
+        return nil, err
+    }
+
+    folders := []string{}
+    files := make(map[string]FetchResultFile)
+
+    doc.Find("#list tbody tr").Each(func(i int, s *goquery.Selection) {
+        cols := s.Find("td")
+        if cols.Length() == 3 {
+            nameNode := cols.Eq(0).Find("a")
+            nameTitle := cols.Eq(0).Text()
+            href, _ := nameNode.Attr("href")
+            name, _ := url.QueryUnescape(href)
+            parts := strings.Split(name, "/")
+            isDir := strings.HasSuffix(name, "/")
+            var entry string
+            if isDir {
+                entry = parts[len(parts)-2]
+            } else {
+                entry = parts[len(parts)-1]
+            }
+            if nameTitle == "Parent directory/" {
+                return
+            }
+            size := cols.Eq(1).Text()
+            date := cols.Eq(2).Text()
+            if isDir {
+                folders = append(folders, entry)
+            } else {
+                files[entry] = FetchResultFile{Size: size, Date: date}
+            }
+        }
+    })
+    return &FetchResultFolder{Folders: folders, Files: files}, nil
+}
+
+func (f *LazyFile) SizeBytesApproximate() (int64, error) {
+    return f.parent.FileSizeBytesApproximate(f.name)
+}
+
+func (f *LazyFile) SizeBytesExact() (int64, error) {
+    return f.parent.FileSizeBytesExact(f.name)
+}
+
+func (f *LazyFile) EnsureFetched() error {
+    return f.parent.FileEnsureFetched(f.name)
+}
+
+func (f *LazyFile) CachePath() (string, error) {
+    return f.parent.FileCachePath(f.name)
+}
+
+func NewLazyFolder(path, cacheDir, rootURL string) *LazyFolder {
+    var wg sync.WaitGroup
+    return &LazyFolder{
+        path:      path,
+        cacheDir:  cacheDir,
+        rootURL:   rootURL,
+        client:    &http.Client{Timeout: 30 * time.Second},
+        semaphore: make(chan struct{}, 80),
+        fetchOnce: make(map[string]chan struct{}),
+        wg:        &wg,
+    }
+}
+
+func (f *LazyFolder) buildURL(parts ...string) string {
+    var cleaned []string
+    for _, p := range parts {
+        cleaned = append(cleaned, strings.Trim(p, "/"))
+    }
+    return strings.Join(cleaned, "/")
+}
+
+func (f *LazyFolder) fetchText(url string) (string, error) {
+    f.semaphore <- struct{}{}
+    defer func() { <-f.semaphore }()
+    resp, err := f.client.Get(url)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+    body, err := io.ReadAll(resp.Body)
+    return string(body), err
+}
+
+func (f *LazyFolder) fetchBytes(url, dest string) error {
+    f.semaphore <- struct{}{}
+    defer func() { <-f.semaphore }()
+    resp, err := f.client.Get(url)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    tmp := dest + ".tmp"
+    out, err := os.Create(tmp)
+    if err != nil {
+        return err
+    }
+    defer out.Close()
+    _, err = io.Copy(out, resp.Body)
+    if err != nil {
+        os.Remove(tmp)
+        return err
+    }
+    return os.Rename(tmp, dest)
+}
+
+func (f *LazyFolder) fetchHeaders(url string) (int64, error) {
+    f.semaphore <- struct{}{}
+    defer func() { <-f.semaphore }()
+    resp, err := f.client.Head(url)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+    length, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+    return length, nil
+}
+
+func (f *LazyFolder) folderFetch(folder string) (*CachedFolderData, error) {
+    cachePath := filepath.Join(f.cacheDir, folder)
+    os.MkdirAll(cachePath, 0755)
+    cacheFile := filepath.Join(cachePath, ".directory_contents_cached_v2")
+    if _, err := os.Stat(cacheFile); err == nil {
+        data, err := os.ReadFile(cacheFile)
+        if err == nil {
+            var cached CachedFolderData
+            if err := json.Unmarshal(data, &cached); err == nil {
+                return &cached, nil
+            }
+        }
+    }
+
+    url := f.buildURL(f.rootURL, folder)
+    html, err := f.fetchText(url)
+    if err != nil {
+        return nil, err
+    }
+    parsed, err := ParseDirectoryHTML(html)
+    if err != nil {
+        return nil, err
+    }
+    cached := &CachedFolderData{
+        Files:   make(map[string]CachedFileData),
+        Folders: parsed.Folders,
+    }
+    for k, v := range parsed.Files {
+        cached.Files[k] = CachedFileData{
+            Size:           ExactSizeBytesFromStr(v.Size),
+            SizeApproximate: ApproximateSizeBytesFromStr(v.Size),
+        }
+    }
+    data, _ := json.Marshal(cached)
+    os.WriteFile(cacheFile+".tmp", data, 0644)
+    os.Rename(cacheFile+".tmp", cacheFile)
+    return cached, nil
+}
+
+func (f *LazyFolder) Cached() (*CachedFolderData, error) {
+    f.cacheMutex.RLock()
+    if f.cache != nil {
+        defer f.cacheMutex.RUnlock()
+        return f.cache, nil
+    }
+    f.cacheMutex.RUnlock()
+
+    f.cacheMutex.Lock()
+    defer f.cacheMutex.Unlock()
+    if f.cache != nil {
+        return f.cache, nil
+    }
+
+    f.wg.Add(1)
+    go func() {
+        defer f.wg.Done()
+        data, err := f.folderFetch(f.path)
+        if err != nil {
+            fmt.Printf("Error fetching %s: %v\n", f.path, err)
+            return
+        }
+        f.cacheMutex.Lock()
+        f.cache = data
+        f.cacheMutex.Unlock()
+    }()
+    data, err := f.folderFetch(f.path)
+    if err != nil {
+        return nil, err
+    }
+    f.cache = data
+    return data, nil
+}
+
+func (f *LazyFolder) FoldersAndFiles() (map[string]*LazyFolder, map[string]*LazyFile, error) {
+    c, err := f.Cached()
+    if err != nil {
+        return nil, nil, err
+    }
+    folders := make(map[string]*LazyFolder)
+    files := make(map[string]*LazyFile)
+    for _, k := range c.Folders {
+        folders[k] = NewLazyFolder(filepath.Join(f.path, k), f.cacheDir, f.rootURL)
+    }
+    for k := range c.Files {
+        files[k] = &LazyFile{name: k, parent: f}
+    }
+    return folders, files, nil
+}
+
+func (f *LazyFolder) FileSizeBytesApproximate(name string) (int64, error) {
+    c, err := f.Cached()
+    if err != nil {
+        return 0, err
+    }
+    file, ok := c.Files[name]
+    if !ok {
+        return 0, fmt.Errorf("file %s not found", name)
+    }
+    if file.Size != nil {
+        return *file.Size, nil
+    }
+    return file.SizeApproximate, nil
+}
+
+func (f *LazyFolder) FileSizeBytesExact(name string) (int64, error) {
+    c, err := f.Cached()
+    if err != nil {
+        return 0, err
+    }
+    file, ok := c.Files[name]
+    if !ok {
+        return 0, fmt.Errorf("file %s not found", name)
+    }
+    if file.Size != nil {
+        return *file.Size, nil
+    }
+    f.wg.Add(1)
+    go func() {
+        defer f.wg.Done()
+        size, err := f.fetchHeaders(f.buildURL(f.rootURL, f.path, name))
+        if err == nil {
+            f.cacheMutex.Lock()
+            c.Files[name] = CachedFileData{Size: &size, SizeApproximate: size}
+            f.cacheMutex.Unlock()
+        }
+    }()
+    return f.fetchHeaders(f.buildURL(f.rootURL, f.path, name))
+}
+
+func (f *LazyFolder) FileEnsureFetched(name string) error {
+    filePath := filepath.Join(f.cacheDir, f.path, name)
+    f.fetchMutex.Lock()
+    if ch, ok := f.fetchOnce[filePath]; ok {
+        f.fetchMutex.Unlock()
+        <-ch
+        return nil
+    }
+    ch := make(chan struct{})
+    f.fetchOnce[filePath] = ch
+    f.fetchMutex.Unlock()
+
+    defer func() {
+        f.fetchMutex.Lock()
+        close(ch)
+        delete(f.fetchOnce, filePath)
+        f.fetchMutex.Unlock()
+    }()
+
+    if _, err := os.Stat(filePath); os.IsNotExist(err) {
+        return f.fetchBytes(f.buildURL(f.rootURL, f.path, name), filePath)
+    }
+    return nil
+}
+
+func (f *LazyFolder) FileCachePath(name string) (string, error) {
+    err := f.FileEnsureFetched(name)
+    if err != nil {
+        return "", err
+    }
+    return filepath.Join(f.cacheDir, f.path, name), nil
+}
+
+func (f *LazyFolder) List(path string) (string, error) {
+    folder, err := WalkPathFindFolder(f, path)
+    if err != nil {
+        return "", err
+    }
+    folders, files, err := folder.FoldersAndFiles()
+    if err != nil {
+        return "", err
+    }
+    var b strings.Builder
+    b.WriteString(fmt.Sprintf("INFO %s:\n", folder.path))
+    b.WriteString(fmt.Sprintf("folders: %v\n", keys(folders)))
+    b.WriteString(fmt.Sprintf("files: %v\n", keys(files)))
+    return b.String(), nil
+}
+
+func (f *LazyFolder) ListRecursive(path string) error {
+    folder, err := WalkPathFindFolder(f, path)
+    if err != nil {
+        return err
+    }
+    return ListImportant(folder, "")
+}
+
+func (f *LazyFolder) Prefetch(path string) error {
+    folder, err := WalkPathFindFolder(f, path)
+    if err != nil {
+        return err
+    }
+    return Prefetch(folder)
+}
+
+func (f *LazyFolder) DuApproximate(path string) error {
+    folder, err := WalkPathFindFolder(f, path)
+    if err != nil {
+        return err
+    }
+    _, err = ListAndSizeApproximateFastParallel(folder, "")
+    return err
+}
+
+filesystems/fuse.go
+package filesystems
+
+import (
+    "context"
+    "fmt"
+    "io"
+    "os"
+    "path/filepath"
+    "sync"
+    "syscall"
+
+    "bazil.org/fuse"
+    "bazil.org/fuse/fs"
+    "golang.org/x/exp/mmap"
+    "golang.org/x/sys/unix"
+)
+
+type FS struct {
+    folder     *LazyFolder
+    fileLocks  sync.Map // map[string]*sync.Mutex
+    mmapFiles  sync.Map // map[string]*mmap.ReaderAt
+    fileHandle sync.Map // map[string]*os.File
+}
+
+func NewFS(folder *LazyFolder) *FS {
+    return &FS{folder: folder}
+}
+
+func (f *FS) Root() (fs.Node, error) {
+    return f.folder, nil
+}
+
+func (f *LazyFolder) Attr(ctx context.Context, a *fuse.Attr) error {
+    a.Mode = os.ModeDir | 0555
+    a.Size = 4096
+    return nil
+}
+
+func (f *LazyFolder) Lookup(name string, ctx context.Context) (fs.Node, error) {
+    folders, files, err := f.FoldersAndFiles()
+    if err != nil {
+        return nil, err
+    }
+    if folder, ok := folders[name]; ok {
+        return folder, nil
+    }
+    if file, ok := files[name]; ok {
+        return file, nil
+    }
+    return nil, fuse.ENOENT
+}
+
+func (f *LazyFolder) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+    folders, files, err := f.FoldersAndFiles()
+    if err != nil {
+        return nil, err
+    }
+    var dirs []fuse.Dirent
+    dirs = append(dirs, fuse.Dirent{Name: ".", Type: fuse.DT_Dir})
+    dirs = append(dirs, fuse.Dirent{Name: "..", Type: fuse.DT_Dir})
+    for name := range folders {
+        dirs = append(dirs, fuse.Dirent{Name: name, Type: fuse.DT_Dir})
+    }
+    for name := range files {
+        dirs = append(dirs, fuse.Dirent{Name: name, Type: fuse.DT_File})
+    }
+    return dirs, nil
+}
+
+func (f *LazyFile) Attr(ctx context.Context, a *fuse.Attr) error {
+    size, err := f.SizeBytesExact()
+    if err != nil {
+        size = 0
+    }
+    a.Mode = 0444
+    a.Size = uint64(size)
+    return nil
+}
+
+func (f *FS) getFileLock(path string) *sync.Mutex {
+    l, _ := f.fileLocks.LoadOrStore(path, &sync.Mutex{})
+    return l.(*sync.Mutex)
+}
+
+func (f *FS) openMmap(path string, file *LazyFile) (*mmap.ReaderAt, error) {
+    if m, ok := f.mmapFiles.Load(path); ok {
+        return m.(*mmap.ReaderAt), nil
+    }
+    cachePath, err := file.CachePath()
+    if err != nil {
+        return nil, err
+    }
+    m, err := mmap.Open(cachePath)
+    if err != nil {
+        return nil, err
+    }
+    f.mmapFiles.Store(path, m)
+    return m, nil
+}
+
+func (f *FS) openHandle(path string, file *LazyFile) (*os.File, error) {
+    if fh, ok := f.fileHandle.Load(path); ok {
+        return fh.(*os.File), nil
+    }
+    cachePath, err := file.CachePath()
+    if err != nil {
+        return nil, err
+    }
+    fh, err := os.Open(cachePath)
+    if err != nil {
+        return nil, err
+    }
+    f.fileHandle.Store(path, fh)
+    return fh, nil
+}
+
+func (f *LazyFile) Open(req *fuse.OpenRequest, resp *fuse.OpenResponse, fsInst *FS) (fs.Handle, error) {
+    err := f.EnsureFetched()
+    if err != nil {
+        return nil, err
+    }
+    path := filepath.Join(f.parent.path, f.name)
+    lock := fsInst.getFileLock(path)
+    lock.Lock()
+    defer lock.Unlock()
+
+    resp.Flags |= fuse.OpenDirectIO
+    return &FileHandle{file: f, fs: fsInst, path: path}, nil
+}
+
+type FileHandle struct {
+    file *LazyFile
+    fs   *FS
+    path string
+}
+
+func (h *FileHandle) Read(req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+    lock := h.fs.getFileLock(h.path)
+    lock.Lock()
+    defer lock.Unlock()
+
+    mmapFile, err := h.fs.openMmap(h.path, h.file)
+    if err != nil {
+        return err
+    }
+    resp.Data = make([]byte, req.Size)
+    n, err := mmapFile.ReadAt(resp.Data, req.Offset)
+    if err != nil && err != io.EOF {
+        return err
+    }
+    resp.Data = resp.Data[:n]
+    return nil
+}
+
+func (h *FileHandle) Release(req *fuse.ReleaseRequest) error {
+    return nil
+}
+
+func Mount(folder *LazyFolder, mountpoint string) {
+    c, err := fuse.Mount(mountpoint, fuse.FSName("go_fs"), fuse.ReadOnly())
+    if err != nil {
+        fmt.Printf("Mount error: %v\n", err)
+        os.Exit(1)
+    }
+    defer c.Close()
+
+    fsInst := NewFS(folder)
+    err = fs.Serve(c, fsInst)
+    if err != nil {
+        fmt.Printf("Serve error: %v\n", err)
+        os.Exit(1)
+    }
+
+    <-c.Ready
+    if c.MountError != nil {
+        fmt.Printf("Mount error: %v\n", c.MountError)
+        os.Exit(1)
+    }
+}
+
+filesystems/types.go
+package filesystems
+
+import (
+    "context"
+    "bazil.org/fuse"
+    "bazil.org/fuse/fs"
+)
+
+type File interface {
+    SizeBytesApproximate() (int64, error)
+    SizeBytesExact() (int64, error)
+    EnsureFetched() error
+    CachePath() (string, error)
+    Attr(ctx context.Context, a *fuse.Attr) error
+    Open(req *fuse.OpenRequest, resp *fuse.OpenResponse, fs *FS) (fs.Handle, error)
+}
+
+type Folder interface {
+    Attr(ctx context.Context, a *fuse.Attr) error
+    Lookup(name string, ctx context.Context) (fs.Node, error)
+    ReadDirAll(ctx context.Context) ([]fuse.Dirent, error)
+    FoldersAndFiles() (map[string]*LazyFolder, map[string]*LazyFile, error)
+}
+
+filesystems/walking.go
+package filesystems
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+func keys(m interface{}) []string {
+	switch v := m.(type) {
+	case map[string]*LazyFolder:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		return keys
+	case map[string]*LazyFile:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		return keys
+	default:
+		return nil
+	}
+}
+
+func WalkPath(folder *LazyFolder, path string) (interface{}, error) {
+	ps := strings.Split(strings.Trim(path, "/"), "/")
+	if len(ps) == 1 && ps[0] == "" {
+		ps = []string{}
+	}
+	current := folder
+	for _, p := range ps {
+		folders, files, err := current.FoldersAndFiles()
+		if err != nil {
+			return nil, err
+		}
+		if next, ok := folders[p]; ok {
+			current = next
+		} else if file, ok := files[p]; ok {
+			return file, nil
+		} else {
+			return nil, fmt.Errorf("%s not found", p)
+		}
+	}
+	return current, nil
+}
+
+func WalkPathFindFolder(folder *LazyFolder, path string) (*LazyFolder, error) {
+	node, err := WalkPath(folder, path)
+	if err != nil {
+		return nil, err
+	}
+	if f, ok := node.(*LazyFolder); ok {
+		return f, nil
+	}
+	return nil, fmt.Errorf("%s is not a folder", path)
+}
+
+func formatSizeBytes(b int64) string { return fmt.Sprintf("%d bytes", b) }
+func formatSizeMiB(b int64) string  { return fmt.Sprintf("%.2f MiB", float64(b)/1024/1024) }
+
+func specialFolder(files map[string]*LazyFile) string {
+	tifCount := 0
+	for name := range files {
+		if strings.HasSuffix(name, ".tif") {
+			tifCount++
+		}
+		if name == ".zarray" {
+			return "zarr archive"
+		}
+	}
+	if tifCount > 20 {
+		return "tiff archive"
+	}
+	return ""
+}
+
+func ListAndSizeApproximateFastParallel(folder *LazyFolder, indent string) (int64, error) {
+	folders, files, err := folder.FoldersAndFiles()
+	if err != nil {
+		return 0, err
+	}
+	sizes := make(chan int64, len(files)+len(folders))
+	var wg sync.WaitGroup
+
+	for _, file := range files {
+		wg.Add(1)
+		go func(f *LazyFile) {
+			defer wg.Done()
+			size, _ := f.SizeBytesApproximate()
+			sizes <- size
+		}(file)
+	}
+	for _, subFolder := range folders {
+		wg.Add(1)
+		go func(f *LazyFolder) {
+			defer wg.Done()
+			size, _ := ListAndSizeApproximateFastParallel(f, indent+"    ")
+			sizes <- size
+		}(subFolder)
+	}
+
+	go func() {
+		wg.Wait()
+		close(sizes)
+	}()
+
+	total := int64(0)
+	for size := range sizes {
+		total += size
+	}
+	fmt.Printf("folder %s%s %s\n", indent, folder.path, formatSizeMiB(total))
+	return total, nil
+}
+
+func Prefetch(folder *LazyFolder) error {
+	folders, files, err := folder.FoldersAndFiles()
+	if err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	for _, file := range files {
+		wg.Add(1)
+		go func(f *LazyFile) {
+			defer wg.Done()
+			f.EnsureFetched()
+		}(file)
+	}
+	for _, subFolder := range folders {
+		wg.Add(1)
+		go func(f *LazyFolder) {
+			defer wg.Done()
+			Prefetch(f)
+		}(subFolder)
+	}
+	wg.Wait()
+	return nil
+}
+
+func ListImportant(folder *LazyFolder, indent string) error {
+	folders, files, err := folder.FoldersAndFiles()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s%s\n", indent, folder.path)
+	special := specialFolder(files)
+	if special == "" {
+		for _, subFolder := range folders {
+			ListImportant(subFolder, indent+"    ")
+		}
+		for name, file := range files {
+			size, _ := file.SizeBytesApproximate()
+			fmt.Printf("%s    %s %s %s\n", indent, name, formatSizeBytes(size), formatSizeMiB(size))
+		}
+	} else {
+		fmt.Printf("%s    probably %s\n", indent, special)
+	}
+	return nil
+}
+
+main.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+	"go_fs_project/filesystems"
+)
+
+var (
+	cacheDir string
+	rootURL  string
+	exiting  = make(chan struct{})
+	wg       sync.WaitGroup
+)
+
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Printf(`
+usage:
+    %s <CACHE_DIR> <URL> mount <PATH> <MOUNT_POINT>
+    %s <CACHE_DIR> <URL> list <PATH>
+    %s <CACHE_DIR> <URL> list-recursive <PATH>
+    %s <CACHE_DIR> <URL> prefetch <PATH>
+    %s <CACHE_DIR> <URL> du_approximate <PATH>
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+		os.Exit(1)
+	}
+
+	cacheDir = os.Args[1]
+	rootURL = os.Args[2]
+	cmd := os.Args[3]
+
+	folder := filesystems.NewLazyFolder("", cacheDir, rootURL)
+
+	switch cmd {
+	case "mount":
+		if len(os.Args) != 6 {
+			fmt.Println("mount requires PATH and MOUNT_POINT")
+			os.Exit(1)
+		}
+		path := os.Args[4]
+		mountpoint := os.Args[5]
+		subFolder, err := filesystems.WalkPathFindFolder(folder, path)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		filesystems.Mount(subFolder, mountpoint)
+	case "list":
+		path := os.Args[4]
+		info, err := folder.List(path)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(info)
+	case "list-recursive":
+		path := os.Args[4]
+		err := folder.ListRecursive(path)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "prefetch":
+		path := os.Args[4]
+		err := folder.Prefetch(path)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "du_approximate":
+		path := os.Args[4]
+		err := folder.DuApproximate(path)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	default:
+		fmt.Printf("Unknown command: %s\n", cmd)
+		os.Exit(1)
+	}
+
+	close(exiting)
+	wg.Wait()
+}

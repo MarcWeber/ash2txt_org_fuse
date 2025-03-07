@@ -1,4 +1,5 @@
 from . import types as t
+from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Iterable
 import re
 from collections import defaultdict
 import os
@@ -6,6 +7,7 @@ from . import ash2txtorg_cached as ac
 from pathlib import Path
 from functools import reduce
 import asyncio
+from typing import Iterable
 
 """
 some implementations to list size or prefetch files
@@ -24,11 +26,17 @@ def format_size_MiB(b):
 
 re_working_mesh_window = re.compile('^working_mesh_.*window')
 
-def special_folder(folder, folders, files: list[str]):
+def special_folder(folder: t.Folder, folders: Iterable[str], files: Iterable[str]):
     ps = folder.path.split()
 
     if len(ps) >= 2 and ps[-2].endswith(".volpkg") and ps[-1] == "paths": 
         return "volpkg/paths"
+
+    if len(ps) > 0:
+        # whatever working is its not a scroll
+        for k in ['working', 'volumetric-instance-labels']:
+            if k == ps[-1]:
+                return k
 
     def c_files(l):
         return len([x for x in files if l(x)])
@@ -39,6 +47,7 @@ def special_folder(folder, folders, files: list[str]):
     count_yxz = c_folders(lambda x: x.startswith('cell_yxz'))
     count_sample = c_folders(lambda x: x.startswith("sample_"))
     count_point_cloud = c_folders(lambda x: x.startswith("point_cloud_"))
+
     if count_yxz > 2:
         return "yxz?"
     elif c_folders(lambda x: re_working_mesh_window.match(x)) > 2:
@@ -74,43 +83,48 @@ async def walk_path_find_folder(folder: t.Folder, path: t.MyPath) -> t.Folder | 
         raise Exception(f"not a folder maybe file {path}")
     return f
 
-async def list_special_and_approximate_size_fast(lines: list[str], folder: t.Folder, sums_by_ext = True, print_each = True, print_within_special = False, indent = "") -> int:
+async def list_special_and_approximate_size_fast(folder: t.Folder, sums_by_ext = True, print_each = True, print_within_special = False, indent = "") -> tuple[int, list[str]]:
     """ first list subs so that there is some output ..
         fast because approximate bytes are given in directory listings found in HTML
     """
     folders, files = await folder.folders_and_files()
     childs = []
     path = folder.path
-    special = special_folder(folder, folders, files)
+    special = special_folder(folder, folders.keys(), files)
     pe = print_each and ( special == None or print_within_special)
     folder_size = 0
-    folder_sizes = await asyncio.gather(
-        *[ list_special_and_approximate_size_fast(lines, v, sums_by_ext, pe, print_within_special, f"{indent}    ") for name, v in folders.items()]
+    items = await asyncio.gather(
+        *[ list_special_and_approximate_size_fast(v, sums_by_ext, pe, print_within_special, f"{indent}    ") for name, v in folders.items()],
     )
-    folder_sizes += folder_sizes
+
+    for size, lines in items:
+        folder_size += size
+        childs += lines
+
     sum_by_ext = defaultdict(lambda: 0)
     counts_by_ext = defaultdict(lambda: 0)
     for name in files:
         r, ext = os.path.splitext(name)
         file_size = await folder.file_size_bytes_approximate(name)
+        folder_size += file_size
+
         if pe:
             if sums_by_ext:
                 sum_by_ext[ext] += file_size
                 counts_by_ext[ext] += 1
             else:
                 childs.append((f"{indent}    {name} {file_size}"))
-        folder_size += file_size
 
     if pe and sums_by_ext:
         for name, v in sum_by_ext.items():
-            childs.append(f"{indent} extension={name}: count:{counts_by_ext[name]} {format_size_MiB(v)}")
+            childs.append(f"{indent}{ind}extension={name}: count:{counts_by_ext[name]} {format_size_MiB(v)}")
 
+    flines = []
     if print_each:
-        lines.append(f"{indent}{path.name()}/ {format_size_MiB(folder_size)}")
+        flines.append(f"{indent}{path.name()}/ {format_size_MiB(folder_size)} {str(path)}")
+        flines += childs
 
-    lines += childs
-
-    return folder_size
+    return folder_size, flines
 
 
 async def list_and_size_approximate_fast_parallel(folder: t.Folder, limiter: asyncio.Semaphore, indent = "") -> int:
@@ -124,7 +138,6 @@ async def list_and_size_approximate_fast_parallel(folder: t.Folder, limiter: asy
     folder_sizes = [list_and_size_approximate_fast_parallel(x, limiter, f"{indent}{ind}") for x in folders.values()]
     all = await asyncio.gather(*[*file_sizes, *folder_sizes])
     total = reduce(lambda a, b: a + b, all, 0)
-    print(f"folder {indent}{folder.path} {format_size_MiB(total)}")
     return total
 
 

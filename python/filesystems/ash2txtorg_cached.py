@@ -1,6 +1,7 @@
 from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Optional
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
+from fastclasses_json import dataclass_json
 from urllib.parse import unquote
 import asyncio
 from . import types as t
@@ -65,11 +66,13 @@ def parse_directory_html(html: str) -> FetchResultFolder:
 
 
 # CACHING DATA TYPES
+@dataclass_json
 @dataclass
 class CachedFileData:
     size: Optional[int]
     size_approximate: int
 
+@dataclass_json
 @dataclass
 class CachedFolderData:
     files:   dict[str, CachedFileData]
@@ -122,6 +125,8 @@ class LazyFolder(t.Folder):
             files   = c.data.files
             return t.FoldersAndFilesDC(folders = folders, files = files)
 
+        ## is it wrorth it ? I if you keep mount running then yes
+        ## if you walk then no ?
         self.faf = async_refreshable_weakref.AsyncRefreshableWeakRef(opts.loop, recreate = recreate)
 
     def cached(self):

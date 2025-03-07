@@ -1,3 +1,4 @@
+from argparse import ONE_OR_MORE
 from dataclasses import dataclass
 from os.path import exists
 import traceback
@@ -44,12 +45,33 @@ def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
     """Run the event loop in a background thread and ensure all tasks complete before stopping."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
-    pending_tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
-    print(f"Waiting for remaining tasks in loop... {pending_tasks}")
+    tasks = asyncio.all_tasks(loop)
+    pending_tasks = []
+    other = []
+    for task in tasks:
+        if hasattr(task, "cancel_on_quit"):
+            task.cancel()
+            other.append(task)
+            continue
+        if task.done():
+            continue
+        pending_tasks.append(task)
+
+    try:
+        loop.run_until_complete(asyncio.gather(*other, return_exceptions=True))
+    except:
+        pass
+        # traceback.print_exc()
+
     if pending_tasks:
-        loop.run_until_complete(asyncio.gather(*pending_tasks))
+        try:
+            loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+        except:
+            traceback.print_exc()
     print("Waiting for remaining tasks in loop done.")
     loop.close()  # Ensure resources are released
+    print(f"other.len {len(other)}")
+    print(f"pending_tasks.len {len(pending_tasks)}")
 
 loop_thread = Thread(target=start_background_loop, args=(thread_loop,), daemon=False)
 loop_thread.start()
@@ -89,13 +111,13 @@ def main():
 
     def get_folder(cache_directory: Path, root_url: str):
         loop = thread_loop
-        fetch_limiter = asyncio.Semaphore(80)
+        fetch_limiter = asyncio.Semaphore(40) # 80 yields too many requests
         limit = 100
         connector = aiohttp.TCPConnector(limit = limit, limit_per_host= limit, loop = thread_loop)
         session = aiohttp.ClientSession(connector=connector)
 
         def build_url (*parts: str):
-            return '/'.join([x.strip('/') for x in parts])
+            return '/'.join([x for x in parts])
 
         fetching = {}
         async def forever_show_fetching():
@@ -149,12 +171,22 @@ def main():
             nonlocal cache_directory
             f = cache_directory / str(folder)
             f.mkdir(exist_ok=True, parents=True)
-            cache_file = f / ".directory_contents_cached_v2.pickled"
+
+            # deprecated, not shareable with other languages ..
+            cache_file_pickled = f / ".directory_contents_cached_v2.pickled"
+
+            cache_file_json = f / ".directory_contents_cached_v2.json"
             async def store_data(data):
-                tmp = cache_file.with_suffix('.tmp')
-                with tmp.open('wb') as f:
-                    pickle.dump(data, f)
-                tmp.rename(cache_file)
+                tmp = cache_file_json.with_suffix('.tmp')
+                with tmp.open('w') as f:
+                    # dataclasses_json
+                    f.write(data.to_json())
+                tmp.rename(cache_file_json)
+                # tmp.rename(cache_file_pickled)
+                # tmp = cache_file_pickled.with_suffix('.tmp')
+                # with tmp.open('wb') as f:
+                #     pickle.dump(data, f)
+                # tmp.rename(cache_file_pickled)
 
             async def frech_fetch():
                 print(f"frech_fetch ")
@@ -171,45 +203,52 @@ def main():
                     return store
                 return await fetch_once.by_key(url, fetch)
 
-            cache_file_v1 = f / ".directory_contents_cached"
-            if cache_file.exists():
-                with cache_file.open('rb') as f:
+            # cache_file_v1 = f / ".directory_contents_cached"
+            if cache_file_json.exists():
+                with cache_file_json.open('r') as f:
+                    data = ash2txtorg_cached.CachedFolderData.from_json(f.read())
+                store = ash2txtorg_cached.AutoStore(loop, data, store_data)
+            elif cache_file_pickled.exists():
+                with cache_file_pickled.open('rb') as f:
                     data = pickle.load(f)
                 store = ash2txtorg_cached.AutoStore(loop, data, store_data)
-            elif (cache_file_v1.exists()):
-                # reuse previous data I already fetched (legacy)
-                # hack handling of my own fetched data
-                @dataclass
-                class WalkFile:
-                    name: str
-                    contents: Optional[bytes]
-                    size: Optional[int]
-                    date: str
+                # convert to json
+                print(f"converting to JSON {cache_file_json}")
+                await store_data(data)
+            # elif (cache_file_v1.exists()):
+            #     # reuse previous data I already fetched (legacy)
+            #     # hack handling of my own fetched data
+            #     @dataclass
+            #     class WalkFile:
+            #         name: str
+            #         contents: Optional[bytes]
+            #         size: Optional[int]
+            #         date: str
 
-                class CustomUnpickler(pickle.Unpickler):
-                    def find_class(self, module, name):
-                        if name == "WalkFile":
-                            return WalkFile
-                        raise Exception("X")
+            #     class CustomUnpickler(pickle.Unpickler):
+            #         def find_class(self, module, name):
+            #             if name == "WalkFile":
+            #                 return WalkFile
+            #             raise Exception("X")
 
-                with cache_file_v1.open('rb') as f:
-                    [folders_v1, files_v1] = cast(Tuple[list[str], dict[str, WalkFile]] , CustomUnpickler(f).load())
-                    # print(f"files_v1 {files_v1}")
-                x = [k for k,v in files_v1.items() if v.size == None]
-                if len(x) > 0:
-                    print(f"forcing fresh fetch {x}")
-                    store = await frech_fetch()
-                else:
-                    files   = {k: ash2txtorg_cached.CachedFileData(size = v.size, size_approximate = v.size if v.size else 999999)  for k, v in files_v1.items()}
-                    data = ash2txtorg_cached.CachedFolderData(folders = folders_v1, files = files)
-                    store = ash2txtorg_cached.AutoStore(loop, data, store_data)
-                    store.changed()
+            #     with cache_file_v1.open('rb') as f:
+            #         [folders_v1, files_v1] = cast(Tuple[list[str], dict[str, WalkFile]] , CustomUnpickler(f).load())
+            #         # print(f"files_v1 {files_v1}")
+            #     x = [k for k,v in files_v1.items() if v.size == None]
+            #     if len(x) > 0:
+            #         print(f"forcing fresh fetch {x}")
+            #         store = await frech_fetch()
+            #     else:
+            #         files   = {k: ash2txtorg_cached.CachedFileData(size = v.size, size_approximate = v.size if v.size else 999999)  for k, v in files_v1.items()}
+            #         data = ash2txtorg_cached.CachedFolderData(folders = folders_v1, files = files)
+            #         store = ash2txtorg_cached.AutoStore(loop, data, store_data)
+            #         store.changed()
             else:
                 store = await frech_fetch()
             return store
 
         async def file_fetch_size(folder: MyPath, name: str):
-            headers = await fetch_headers(build_url(root_url, folder, name))
+            headers = await fetch_headers(build_url(root_url, str(folder), name))
             return int(headers['Content-Length'])
 
         fetch_once = LimitByKey(loop)
@@ -221,7 +260,7 @@ def main():
                 async def fetch():
                     tmp = file.with_suffix(".tmp")
                     # TODO some files are large like 800 MB ! use streaming ?
-                    binary = await fetch_bytes(build_url(root_url, folder, name))
+                    binary = await fetch_bytes(build_url(root_url, str(folder), name))
                     with tmp.open("wb") as f:
                         f.write(binary)
                     tmp.rename(file)
@@ -311,7 +350,8 @@ def main():
             folder = get_folder(cache_directory, root_url)
             folder = await walking.walk_path_find_folder(folder, MyPath(path))
             assert folder
-            await walking.list_and_size_approximate_fast_parallel(folder, limiter)
+            size = await walking.list_and_size_approximate_fast_parallel(folder, limiter)
+            print(f"size {walking.format_size_MiB(size)}")
         wait_async(du_approximate)()
 
     elif argv[0] == "cache_dir_check_sizes":
@@ -331,13 +371,9 @@ def main():
             folder = get_folder(cache_directory, root_url)
             folder = await walking.walk_path_find_folder(folder, MyPath(path))
             assert folder
-            lines = []
-            await walking.list_special_and_approximate_size_fast(lines, folder)
-            for l in lines:
-                print(l)
+            total, lines = await walking.list_special_and_approximate_size_fast(folder)
+            [ print(l) for l in lines ]
         wait_async(du_approximate)()
-
-
     else:
         raise Exception(f"bad command {argv[0]}")
 

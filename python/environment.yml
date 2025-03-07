@@ -1,0 +1,13 @@
+name: ash2txt_org_fuse
+
+channels:
+  - defaults
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - pyfuse
+  - fusepy3
+  - httpio
+  - nest_asyncio
+  - fastclasses-json
