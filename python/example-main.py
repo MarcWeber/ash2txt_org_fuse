@@ -12,6 +12,7 @@ import asyncio
 from filesystems import walking, ash2txtorg_cached
 from filesystems.types import MyPath
 from threading import Thread, Event
+from filesystems.later import later_instance
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -56,6 +57,8 @@ def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
         if task.done():
             continue
         pending_tasks.append(task)
+
+    later_instance.do_regularly(True)
 
     try:
         loop.run_until_complete(asyncio.gather(*other, return_exceptions=True))
@@ -122,6 +125,7 @@ def main():
         fetching = {}
         async def forever_show_fetching():
             while not exiting.is_set():
+                later_instance.do_regularly()
                 await asyncio.sleep(10)
                 t = time()
                 if len(fetching) > 0:

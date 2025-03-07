@@ -1,4 +1,5 @@
 from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Optional
+from .later import later_instance
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from fastclasses_json import dataclass_json
@@ -93,12 +94,17 @@ class AutoStore(Generic[T]):
         self._save_task = None
         self.store_data = store_data
 
+
+    def do_later(self):
+        self.store_data(self.data)
+
     def changed(self):
+        later_instance.once(self, ticks = 5)
+
         if self._save_task and not self._save_task.done():
             self._save_task.cancel()  # Cancel previous task
         async def _save_after_delay():
             await asyncio.sleep(self.delay)
-            self.store_data(self.data)
         self._save_task = self.loop.create_task(_save_after_delay())
 
 @dataclass

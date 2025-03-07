@@ -617,8 +617,7 @@ func (f *LazyFolder) PrefetchMeta(path string) error {
         return err
     }
     for _, subFolder := range folders {
-        if err := subFolder.PrefetchMeta("");
-            err != nil {
+        if err := subFolder.PrefetchMeta(""); err != nil {
             return err
         }
     }
@@ -634,14 +633,28 @@ func (f *LazyFolder) PrefetchFiles(path string) error {
     if err != nil {
         return err
     }
+    var wg sync.WaitGroup
+    errors := make(chan error, len(files))
     for _, file := range files {
-        if err := file.EnsureFetched(); err != nil {
+        wg.Add(1)
+        go func(file *LazyFile) {
+            defer wg.Done()
+            if err := file.EnsureFetched(); err != nil {
+                errors <- err
+            }
+        }(file)
+    }
+    go func() {
+        wg.Wait()
+        close(errors)
+    }()
+    for err := range errors {
+        if err != nil {
             return err
         }
     }
     for _, subFolder := range folders {
-        if err := subFolder.PrefetchFiles("");
-            err != nil {
+        if err := subFolder.PrefetchFiles(""); err != nil {
             return err
         }
     }
