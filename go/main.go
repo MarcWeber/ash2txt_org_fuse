@@ -32,6 +32,19 @@ func main() {
     rootFolder := filesystems.NewLazyFolder("", cacheDir, rootURL)
 
     switch command {
+    case "mount":
+        if len(os.Args) != 6 {
+            fmt.Println("mount requires PATH and MOUNT_POINT")
+            os.Exit(1)
+        }
+        path := os.Args[4]
+        mountpoint := os.Args[5]
+        subFolder, err := filesystems.WalkPathFindFolder(rootFolder, path)
+        if err != nil {
+            fmt.Printf("Error: %v\n", err)
+            os.Exit(1)
+        }
+        filesystems.Mount(subFolder, mountpoint)
     case "list":
         result, err := rootFolder.List(path)
         if err != nil {

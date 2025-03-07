@@ -134,6 +134,7 @@ class LazyFolder(t.Folder):
         ## is it wrorth it ? I if you keep mount running then yes
         ## if you walk then no ?
         self.faf = async_refreshable_weakref.AsyncRefreshableWeakRef(opts.loop, recreate = recreate)
+        self.prefetch_count = 0
 
     def cached(self):
         if not self.cache:
@@ -155,18 +156,34 @@ class LazyFolder(t.Folder):
 
     async def file_size_bytes_exact(self, name: str) -> int:
         c = await self.cached()
-        file = c.data.files[name]
-        if  file.size != None:
-            return file.size
-        if not name in self.wait_size:
+
+        def fetch_size(name):
             task = self.opts.loop.create_task(self.opts.file_fetch_size(self.path, name))
             self.wait_size[name] = task
+            # prefetch all sizes of this directory
             async def clean():
                 size = await task
                 c.data.files[name].size = size
                 c.changed()
                 del self.wait_size[name]
             self.opts.loop.create_task(clean())
+
+        if self.prefetch_count >= 0:
+            self.prefetch_count += 1
+
+        if self.prefetch_count > 4:
+            self.prefetch_count = -1
+            folders, files = await self.folders_and_files()
+            for f in files:
+                if c.data.files[f] != None and not name in self.wait_size:
+                    fetch_size(name)
+
+        file = c.data.files[name]
+
+        if  file.size != None:
+            return file.size
+        if not name in self.wait_size:
+            fetch_size(name)
 
         return await self.wait_size[name]
 

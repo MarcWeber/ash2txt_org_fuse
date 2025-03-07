@@ -46,6 +46,11 @@ def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
     """Run the event loop in a background thread and ensure all tasks complete before stopping."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+    print("later instance do_regularly")
+    later_instance.do_regularly(True)
+    print("later instance do_regularly done")
+
     tasks = asyncio.all_tasks(loop)
     pending_tasks = []
     other = []
@@ -57,8 +62,6 @@ def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
         if task.done():
             continue
         pending_tasks.append(task)
-
-    later_instance.do_regularly(True)
 
     try:
         loop.run_until_complete(asyncio.gather(*other, return_exceptions=True))
@@ -96,25 +99,26 @@ mount_point     = ""
 
 def main():
     app = sys.argv[0]
-    print(f"""
-    usage:
-    export FUSE_LIBRARY_PATH=/nix/store/czxy0x8wrklqswmkg75cncphj9cq893p-fuse-2.9.9/lib/libfuse.so.2
-    {app} <CACHE_DIR> <URL> fuse-mount <PATH> <MOUNT_POINT>
-    {app} <CACHE_DIR> <URL> fuse_passthrough-mount <PATH> <MOUNT_POINT>
-    {app} <CACHE_DIR> <URL> fuse3-mount <PATH> <MOUNT_POINT>
-    {app} <CACHE_DIR> <URL> list <PATH>
-    {app} <CACHE_DIR> <URL> prefetch <PATH>
-    {app} <CACHE_DIR> <URL> du_approximate <PATH>
-    {app} <CACHE_DIR> <URL> cache_dir_check_sizes <PATH>
-    {app} <CACHE_DIR> <URL> list_special_and_approximate_size_fast <PATH>
-    """)
+    def usage():
+        print(f"""
+        usage:
+        export FUSE_LIBRARY_PATH=/nix/store/czxy0x8wrklqswmkg75cncphj9cq893p-fuse-2.9.9/lib/libfuse.so.2
+        {app} <CACHE_DIR> <URL> fuse-mount <PATH> <MOUNT_POINT>
+        {app} <CACHE_DIR> <URL> fuse_passthrough-mount <PATH> <MOUNT_POINT>
+        {app} <CACHE_DIR> <URL> fuse3-mount <PATH> <MOUNT_POINT>
+        {app} <CACHE_DIR> <URL> list <PATH>
+        {app} <CACHE_DIR> <URL> prefetch <PATH>
+        {app} <CACHE_DIR> <URL> du_approximate <PATH>
+        {app} <CACHE_DIR> <URL> cache_dir_check_sizes <PATH>
+        {app} <CACHE_DIR> <URL> list_special_and_approximate_size_fast <PATH>
+        """)
     cache_directory = Path(sys.argv[1])
     root_url        = sys.argv[2]
     argv = sys.argv[3:]
 
     def get_folder(cache_directory: Path, root_url: str):
         loop = thread_loop
-        fetch_limiter = asyncio.Semaphore(40) # 80 yields too many requests
+        fetch_limiter = asyncio.Semaphore(20) # 80 yields too many requests
         limit = 100
         connector = aiohttp.TCPConnector(limit = limit, limit_per_host= limit, loop = thread_loop)
         session = aiohttp.ClientSession(connector=connector)
@@ -147,17 +151,14 @@ def main():
                 finally:
                     del fetching[m]
 
-        async def fetch_bytes(url:str):
-            async with fetch_limiter:
-                m = f"fetching bytes {url}"
-                print(m)
-                fetching[m] = time()
+        async def fetch_bytes(url:str, f):
+            async with session.get(url) as response:
+                response.raise_for_status()
                 try:
-                    async with session.get(url) as response:
-                        response.raise_for_status()
-                        return  await response.read()  # Get text content
+                    async for chunk in response.content.iter_chunked(1024 * 1024):  # 1 MB chunks
+                        f.write(chunk)
                 finally:
-                    del fetching[m]
+                    response.close()
 
         async def fetch_headers(url:str):
              async with fetch_limiter:
@@ -264,9 +265,8 @@ def main():
                 async def fetch():
                     tmp = file.with_suffix(".tmp")
                     # TODO some files are large like 800 MB ! use streaming ?
-                    binary = await fetch_bytes(build_url(root_url, str(folder), name))
                     with tmp.open("wb") as f:
-                        f.write(binary)
+                        await fetch_bytes(build_url(root_url, str(folder), name), f)
                     tmp.rename(file)
                 return await fetch_once.by_key(file, fetch)
 
@@ -379,7 +379,9 @@ def main():
             [ print(l) for l in lines ]
         wait_async(du_approximate)()
     else:
+        usage()
         raise Exception(f"bad command {argv[0]}")
+
 
 try:
     main()
