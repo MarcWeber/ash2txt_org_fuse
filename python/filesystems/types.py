@@ -60,6 +60,9 @@ class Folder:
         raise NotImplementedError()
     async def file_exists(self, name: str) -> bool:
         raise NotImplementedError()
+    async def file_ensure_fetched(self, name: str):
+        raise NotImplementedError()
+        
 
 FolderOrFile: TypeAlias = 'Tuple[Folder, None | str]'
 MaybeFolderOrFile: TypeAlias = 'Tuple[Folder | None, None | str]'

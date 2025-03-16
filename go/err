@@ -1,0 +1,3 @@
+can you output new files in one code section with multiple cat commands ?
+# go_fs_project/filesystems
+filesystems/fuse3.go:9:2: "path/filepath" imported and not used

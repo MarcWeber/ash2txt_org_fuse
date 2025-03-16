@@ -152,13 +152,20 @@ def main():
                     del fetching[m]
 
         async def fetch_bytes(url:str, f):
-            async with session.get(url) as response:
-                response.raise_for_status()
+            async with fetch_limiter:
+                m = f"fetching text {url}"
+                print(m)
+                fetching[m] = time()
                 try:
-                    async for chunk in response.content.iter_chunked(1024 * 1024):  # 1 MB chunks
-                        f.write(chunk)
+                    async with session.get(url) as response:
+                        response.raise_for_status()
+                        try:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):  # 1 MB chunks
+                                f.write(chunk)
+                        finally:
+                            response.close()
                 finally:
-                    response.close()
+                    del fetching[m]
 
         async def fetch_headers(url:str):
              async with fetch_limiter:
