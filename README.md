@@ -1,11 +1,32 @@
 ash2txt.org file walker and fuse (Python)
 =========================================
-I wanted a nice way to look at all files and lazily mount them
+I wanted a nice way to look at all files and lazily mount them while building
+up a local copy slowly I can access. That's what the tool is about.
 
-ALTERNATIVES
+Python vs Go
 ============
-httpdirfs --no-range-check -o debug -o big_writes -o attr_timeout=3600 -o ac_attr_timeout=3600 -o entry_timeout=3600  -f --cache 'https://dl.ash2txt.org/' /mnt3
-but you're missing out on features such as prefetch etc.
+I started with Python.
+
+Then asked grok to translate to Go .. and after many attempts and some hinting
+it made it. However Go is missing all the 
+python/filesystems/walking.py implementations
+
+Can you use both cause the .json file format is the same.
+If you run tools multiple times they might overwrite each other's json file
+and download files multiple times.
+
+I started GO in a desparate attempt to make it faster. But turned out that
+fuse3 for Python is also fine.
+
+HOW TO RUN PYTHON VERSION
+=========================
+python example-main.py ~/cache-directory/ 'https://dl.ash2txt.org' prefetch <SUB-PATH>
+-> all options open example-main.py
+
+HOW TO RUN GO VERSION
+=====================
+./go_fs_project -fuse-version fuse3  ~/cache-directory  'https://dl.ash2txt.org' mount  <mount-path>
+
 
 FEATURES
 ========
@@ -173,3 +194,13 @@ Give more guidance about what is worth downloading ?
 
 Maybe generate a fake ~/getting-started folder and put some files to explore there.
 Eg only the low resolution versions of zarr and some .tiff files per scroll
+
+
+ALTERNATIVES
+============
+httpdirfs --no-range-check -o debug -o big_writes -o attr_timeout=3600 -o ac_attr_timeout=3600 -o entry_timeout=3600  -f --cache 'https://dl.ash2txt.org/' /mnt3
+but you're missing out on features such as prefetch or estimating size without
+header requests using approximate data without having to run header requests
+for each file. Also folders having 20K files (the tiff storages for example)
+load much slower beacuse for each file a disk access hase to be done. So
+caching does help.
