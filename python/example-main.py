@@ -48,7 +48,6 @@ def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
     loop.run_forever()
 
     print("later instance do_regularly")
-    later_instance.do_regularly(True)
     print("later instance do_regularly done")
 
     tasks = asyncio.all_tasks(loop)
@@ -74,6 +73,10 @@ def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
             loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
         except:
             traceback.print_exc()
+
+    loop.run_until_complete(loop.create_task( later_instance.do_regularly(force = True)))
+    print("later_instance.do_regularly final run force=True done")
+
     print("Waiting for remaining tasks in loop done.")
     loop.close()  # Ensure resources are released
     print(f"other.len {len(other)}")
@@ -110,6 +113,7 @@ def main():
         {app} <CACHE_DIR> <URL> prefetch <PATH>
         {app} <CACHE_DIR> <URL> du_approximate <PATH>
         {app} <CACHE_DIR> <URL> cache_dir_check_sizes <PATH>
+        {app} <CACHE_DIR> <URL> walk_cache_check_download_completness<PATH>
         {app} <CACHE_DIR> <URL> list_special_and_approximate_size_fast <PATH>
         """)
     cache_directory = Path(sys.argv[1])
@@ -129,7 +133,7 @@ def main():
         fetching = {}
         async def forever_show_fetching():
             while not exiting.is_set():
-                later_instance.do_regularly()
+                await later_instance.do_regularly()
                 await asyncio.sleep(10)
                 t = time()
                 if len(fetching) > 0:
@@ -153,14 +157,14 @@ def main():
 
         async def fetch_bytes(url:str, f):
             async with fetch_limiter:
-                m = f"fetching text {url}"
+                m = f"fetching bytes {url}"
                 print(m)
                 fetching[m] = time()
                 try:
                     async with session.get(url) as response:
                         response.raise_for_status()
                         try:
-                            async for chunk in response.content.iter_chunked(1024 * 1024):  # 1 MB chunks
+                            async for chunk in response.content.iter_chunked(10 * 1024 * 1024):  # 10 MB chunks
                                 f.write(chunk)
                         finally:
                             response.close()
@@ -184,21 +188,15 @@ def main():
             f = cache_directory / str(folder)
             f.mkdir(exist_ok=True, parents=True)
 
-            # deprecated, not shareable with other languages ..
-            cache_file_pickled = f / ".directory_contents_cached_v2.pickled"
-
             cache_file_json = f / ".directory_contents_cached_v2.json"
+
             async def store_data(data):
                 tmp = cache_file_json.with_suffix('.tmp')
                 with tmp.open('w') as f:
                     # dataclasses_json
                     f.write(data.to_json())
                 tmp.rename(cache_file_json)
-                # tmp.rename(cache_file_pickled)
-                # tmp = cache_file_pickled.with_suffix('.tmp')
-                # with tmp.open('wb') as f:
-                #     pickle.dump(data, f)
-                # tmp.rename(cache_file_pickled)
+                print(f"stored {cache_file_json}")
 
             async def frech_fetch():
                 print(f"frech_fetch ")
@@ -220,41 +218,6 @@ def main():
                 with cache_file_json.open('r') as f:
                     data = ash2txtorg_cached.CachedFolderData.from_json(f.read())
                 store = ash2txtorg_cached.AutoStore(loop, data, store_data)
-            elif cache_file_pickled.exists():
-                with cache_file_pickled.open('rb') as f:
-                    data = pickle.load(f)
-                store = ash2txtorg_cached.AutoStore(loop, data, store_data)
-                # convert to json
-                print(f"converting to JSON {cache_file_json}")
-                await store_data(data)
-            # elif (cache_file_v1.exists()):
-            #     # reuse previous data I already fetched (legacy)
-            #     # hack handling of my own fetched data
-            #     @dataclass
-            #     class WalkFile:
-            #         name: str
-            #         contents: Optional[bytes]
-            #         size: Optional[int]
-            #         date: str
-
-            #     class CustomUnpickler(pickle.Unpickler):
-            #         def find_class(self, module, name):
-            #             if name == "WalkFile":
-            #                 return WalkFile
-            #             raise Exception("X")
-
-            #     with cache_file_v1.open('rb') as f:
-            #         [folders_v1, files_v1] = cast(Tuple[list[str], dict[str, WalkFile]] , CustomUnpickler(f).load())
-            #         # print(f"files_v1 {files_v1}")
-            #     x = [k for k,v in files_v1.items() if v.size == None]
-            #     if len(x) > 0:
-            #         print(f"forcing fresh fetch {x}")
-            #         store = await frech_fetch()
-            #     else:
-            #         files   = {k: ash2txtorg_cached.CachedFileData(size = v.size, size_approximate = v.size if v.size else 999999)  for k, v in files_v1.items()}
-            #         data = ash2txtorg_cached.CachedFolderData(folders = folders_v1, files = files)
-            #         store = ash2txtorg_cached.AutoStore(loop, data, store_data)
-            #         store.changed()
             else:
                 store = await frech_fetch()
             return store
@@ -266,6 +229,7 @@ def main():
         fetch_once = LimitByKey(loop)
 
         async def file_ensure_fetched(folder: MyPath, name: str):
+            print(f"ensuring fetched {folder} {name}")
             # TODO .. only start this once for large files !
             file = cache_directory / str(folder) / name
             if not file.exists():
@@ -351,7 +315,9 @@ def main():
             folder = await walking.walk_path_find_folder(folder, MyPath(path))
             assert folder
             limiter = asyncio.Semaphore(120)
-            await walking.prefetch(folder, limiter)
+            errors = walking.Errors()
+            await walking.prefetch(folder, limiter, errors, True)
+            errors.print_all()
         wait_async(prefetch)()
 
     elif argv[0] == "du_approximate":
@@ -372,8 +338,21 @@ def main():
             folder = get_folder(cache_directory, root_url)
             folder = await walking.walk_path_find_folder(folder, MyPath(path))
             assert folder
-            await walking.walk_cache_dir_check_sizes(folder, cache_directory / path)
+            errors = walking.Errors()
+            await walking.walk_cache_dir_check_sizes(folder, cache_directory / path, errors)
         wait_async(du_approximate)()
+
+    elif argv[0] == "walk_cache_check_download_completness":
+        limiter = asyncio.Semaphore(50)
+        path = argv[1]
+        async def du_approximate():
+            folder = get_folder(cache_directory, root_url)
+            folder = await walking.walk_path_find_folder(folder, MyPath(path))
+            assert folder
+            errors = walking.Errors()
+            await walking.walk_cache_check_download_completness(folder, cache_directory / path, errors)
+        wait_async(du_approximate)()
+
 
     elif argv[0] == "list_special_and_approximate_size_fast":
         limiter = asyncio.Semaphore(50)

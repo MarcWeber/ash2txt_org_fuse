@@ -14,6 +14,12 @@ some implementations to list size or prefetch files
 
 """
 
+class Errors(list):
+
+    def print_all(self):
+        for e in self:
+            print(e)
+
 # TODO correct typing
 
 ind = "    "
@@ -157,13 +163,33 @@ async def list_and_size_exact_slow(folder: t.Folder, indent = "") -> int:
     print(f"folder {indent}{folder.path} {size}")
     return size
 
-async def prefetch(folder: ac.LazyFolder, limiter: asyncio.Semaphore):
+async def prefetch(folder: ac.LazyFolder, limiter: asyncio.Semaphore, errors: Errors, fix = False):
+    # question is what's correct way to fix ?
+    # maybe remove all the .directory_contents_cached_v2.json files and refetch ?
+    # because you don't know what's wrong .. :-(
+
     async with limiter: # must be bigger than rec depth !
         # should we have some additional limiting ? ..
         folders, files = await folder.folders_and_files()
-        fetch_files   = [folder.file_ensure_fetched(name) for name in files]
-        fetch_folders = [prefetch(x, limiter) for x in folders.values()]
-        await asyncio.gather(*[*fetch_folders, *fetch_files])
+
+    async def ensure(folder: ac.LazyFolder, name: str):
+        async with limiter: # must be bigger than rec depth !
+            if fix:
+                cf = Path(await folder.file_cache_path(name))
+                if cf.exists():
+                    expected_size = await folder.file_size_bytes_exact(name)
+                    size = cf.stat().st_size
+                    if size != expected_size:
+                        msg = f"UNLINKING {cf} SHOULD{expected_size} WAS {size}"
+                        print(msg)
+                        errors.append(msg)
+                        cf.unlink()
+
+            await folder.file_ensure_fetched(name)
+
+    fetch_files   = [ensure(folder, name) for name in files]
+    fetch_folders = [prefetch(x, limiter, errors) for x in folders.values()]
+    await asyncio.gather(*[*fetch_folders, *fetch_files])
 
 
 async def list_special(folder: t.Folder, indent = ""):
@@ -197,15 +223,39 @@ async def info(thing: t.FileOrFolder):
     else:
         return "neither file nor directory - not found"
 
-async def walk_cache_dir_check_sizes(folder: t.Folder, cache_dir: Path):
+async def walk_cache_dir_check_sizes(folder: t.Folder, cache_dir: Path, errors: Errors):
     folders, files = await folder.folders_and_files()
     size = 0
     for k, v in folders.items():
-        await walk_cache_dir_check_sizes(v, cache_dir / k)
+        await walk_cache_dir_check_sizes(v, cache_dir / k, errors)
     for name in files:
         cf = cache_dir / name
         if cf.exists():
             expected_size = await folder.file_size_bytes_exact(name)
-            size = os.path.getsize(cf)
+            size = cf.stat().st_size
             if (expected_size != size):
-                print(f"{cf} expected={expected_size} size={size}")
+                errors.append(f"{cf} expected={expected_size} size={size}")
+
+async def walk_cache_check_download_completness(folder: t.Folder, cache_dir: Path, errors: Errors):
+    total = 0
+    downloaded = 0
+
+    async def rec(folder: t.Folder, cache_dir: Path):
+        folders, files = await folder.folders_and_files()
+        nonlocal total, downloaded
+        total = 0
+        await asyncio.gather(*[rec(v, cache_dir / k) for [k,v] in folders.items()])
+        for name in files:
+            cf = cache_dir / name
+            expected_size = await folder.file_size_bytes_exact(name)
+            if cf.exists():
+                size = cf.stat().st_size
+                if size != expected_size:
+                    errors.append(f"{cf} expected={expected_size} size={size}")
+                downloaded += size
+                total += expected_size
+            else:
+                total += expected_size
+
+    await rec(folder, cache_dir)
+    print(f" {format_size_MiB(downloaded)} / {format_size_MiB(total)} {downloaded/total:.2f}")

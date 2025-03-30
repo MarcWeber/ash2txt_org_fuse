@@ -94,9 +94,8 @@ class AutoStore(Generic[T]):
         self._save_task = None
         self.store_data = store_data
 
-
-    def do_later(self):
-        self.store_data(self.data)
+    async def do_later_async(self):
+        return await self.store_data(self.data)
 
     def changed(self):
         later_instance.once(self, ticks = 5)
@@ -157,6 +156,9 @@ class LazyFolder(t.Folder):
     async def file_size_bytes_exact(self, name: str) -> int:
         c = await self.cached()
 
+        if c.data.files[name].size:
+            return c.data.files[name].size
+
         def fetch_size(name):
             task = self.opts.loop.create_task(self.opts.file_fetch_size(self.path, name))
             self.wait_size[name] = task
@@ -175,13 +177,14 @@ class LazyFolder(t.Folder):
             self.prefetch_count = -1
             folders, files = await self.folders_and_files()
             for f in files:
-                if c.data.files[f] != None and not name in self.wait_size:
+                if c.data.files[f] != None and not name in self.wait_size and not c.data.files[f].size:
                     fetch_size(name)
 
         file = c.data.files[name]
 
         if  file.size != None:
             return file.size
+
         if not name in self.wait_size:
             fetch_size(name)
 

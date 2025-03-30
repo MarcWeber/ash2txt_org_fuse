@@ -1,10 +1,11 @@
 import traceback
+import asyncio
 from typing import TypeAlias, Optional, Protocol, TypedDict
 
 # have some maintainance tasks of some which have to run before quit
 
 class LOpts(TypedDict):
-    once: Optional[bool]
+    once:  Optional[bool]
     ticks: Optional[int]
 
 class Later:
@@ -27,18 +28,23 @@ class Later:
     def remove(self, a):
         del self.later[a]
 
-    def do_regularly(self, force = False):
+    async  def do_regularly(self, force = False):
+        tasks = []
         for thing, o in list(self.later.items()):
             try:
                 ticks = o.get('ticks')
                 if ticks:
                    ticks -= 1
                    o["ticks"] = ticks
-                if ticks != None or ticks < 0 or force:
-                    thing.do_later()
+                if (ticks != None and ticks < 0) or force:
+                    if hasattr(thing, "do_later"):
+                        thing.do_later()
+                    if hasattr(thing, "do_later_async"):
+                        tasks.append(thing.do_later_async())
                     if o["once"]:
                         self.remove(thing)
             except:
                 traceback.print_exc()
+        return await asyncio.gather(*tasks)
 
 later_instance = Later()

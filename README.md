@@ -5,6 +5,7 @@ I wanted a nice way to look at all files and lazily mount them
 ALTERNATIVES
 ============
 httpdirfs --no-range-check -o debug -o big_writes -o attr_timeout=3600 -o ac_attr_timeout=3600 -o entry_timeout=3600  -f --cache 'https://dl.ash2txt.org/' /mnt3
+but you're missing out on features such as prefetch etc.
 
 FEATURES
 ========
