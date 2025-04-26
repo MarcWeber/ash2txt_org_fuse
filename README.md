@@ -7,10 +7,6 @@ Python vs Go
 ============
 I started with Python.
 
-Then asked grok to translate to Go .. and after many attempts and some hinting
-it made it. However Go is missing all the 
-python/filesystems/walking.py implementations
-
 Can you use both cause the .json file format is the same.
 If you run tools multiple times they might overwrite each other's json file
 and download files multiple times.
@@ -26,6 +22,9 @@ python example-main.py ~/cache-directory/ 'https://dl.ash2txt.org' prefetch <SUB
 HOW TO RUN GO VERSION
 =====================
 ./go_fs_project -fuse-version fuse3  ~/cache-directory  'https://dl.ash2txt.org' mount  <mount-path>
+Indeed I admit grok wrote most of the go code by >>repeating<< please fix.
+Please look at Python code and do it the way. Integrate that. It still dosen't
+work. Repeat. ... but .. finally it worked.
 
 
 FEATURES
