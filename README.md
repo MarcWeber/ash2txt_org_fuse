@@ -14,6 +14,8 @@ and download files multiple times.
 I started GO in a desparate attempt to make it faster. But turned out that
 fuse3 for Python is also fine.
 
+License: GPLv2 GPLv3 MIT (choose one or get in touch if you have other needs)
+
 HOW TO RUN PYTHON VERSION
 =========================
 python example-main.py ~/cache-directory/ 'https://dl.ash2txt.org' prefetch <SUB-PATH>
