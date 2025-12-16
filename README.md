@@ -104,6 +104,12 @@ speed
 =====
 It works. Maybe Python is the wrong tool - but for now it works
 
+Speeding up initial access (getting some .directory_contents_cached_v2.json fast)
+
+Checkout this directory: https://github.com/MarcWeber/ash2txt_org_fuse-json-files
+You can ues GIT_DIR to move .git out of direcotry later.
+
+
 Example: find all scrolls and levels and sizes:
 ===============================================
 python example-main.py $ASH2TXT_CACHE 'https://dl.ash2txt.org' list_special_and_approximate_size_fast "full-scrolls" >| /tmp/sizes-full-scrolls
