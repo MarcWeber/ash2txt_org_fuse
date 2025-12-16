@@ -17,8 +17,8 @@ import (
 )
 
 type CachedFileData struct {
-	Size           *int64 `json:"size"`
-	SizeApproximate int64  `json:"size_approximate"`
+	Size           *int64 `json:"s"`
+	SizeApproximate int64  `json:"a"`
 }
 
 type CachedFolderData struct {

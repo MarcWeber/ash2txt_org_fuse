@@ -205,3 +205,9 @@ header requests using approximate data without having to run header requests
 for each file. Also folders having 20K files (the tiff storages for example)
 load much slower beacuse for each file a disk access hase to be done. So
 caching does help.
+
+CHANGELOG:
+==========
+2025-12-16:
+    saving disks pace renaming size_approximate to "a" and size to "s" in json files:
+    find -name '.directory_contents_cached_v2.json'  -type f -print0 | xargs -0 sed -i -e 's@"size_approximate"@"a"@g' -e 's@"size"@"s"@g'

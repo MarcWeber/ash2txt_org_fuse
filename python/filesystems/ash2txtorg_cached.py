@@ -1,8 +1,8 @@
 from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Optional
 from .later import later_instance
 from bs4 import BeautifulSoup
-from dataclasses import dataclass
-from fastclasses_json import dataclass_json
+from dataclasses import dataclass, field
+from fastclasses_json import dataclass_json, config
 from urllib.parse import unquote
 import asyncio
 from . import types as t
@@ -70,8 +70,8 @@ def parse_directory_html(html: str) -> FetchResultFolder:
 @dataclass_json
 @dataclass
 class CachedFileData:
-    size: Optional[int]
-    size_approximate: int
+    size: Optional[int]   field(metadata=config(field_name="s"))
+    size_approximate: int field(metadata=config(field_name="a"))
 
 @dataclass_json
 @dataclass
