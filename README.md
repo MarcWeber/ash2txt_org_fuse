@@ -109,6 +109,10 @@ Speeding up initial access (getting some .directory_contents_cached_v2.json fast
 Checkout this directory: https://github.com/MarcWeber/ash2txt_org_fuse-json-files
 You can ues GIT_DIR to move .git out of direcotry later.
 
+Currently the subdirectories of each zarr archive are iterated over.
+The python walker could be implemented in a way estimating sizes
+by reading zarr json files and use that instead.
+
 
 Example: find all scrolls and levels and sizes:
 ===============================================
