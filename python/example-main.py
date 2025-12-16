@@ -137,7 +137,8 @@ def main():
                 await asyncio.sleep(10)
                 t = time()
                 if len(fetching) > 0:
-                    print(f"FETCHING STATE SUMMARY {len(fetching)})\n{"\n".join([f"{k} {t-v:.1f}sec" for k, v in fetching.items()])} ")
+                    x = "\n".join([f"{k} {t-v:.1f}sec" for k, v in fetching.items()])
+                    print(f"FETCHING STATE SUMMARY {len(fetching)}\n{x}")
 
                 pending_tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
                 print(f"running tasks in loop... {len(pending_tasks)}")
@@ -216,7 +217,9 @@ def main():
             # cache_file_v1 = f / ".directory_contents_cached"
             if cache_file_json.exists():
                 with cache_file_json.open('r') as f:
-                    data = ash2txtorg_cached.CachedFolderData.from_json(f.read())
+                    js = f.read()
+                    print(f"js {cache_file_json} {cache_file_json}")
+                    data = ash2txtorg_cached.CachedFolderData.from_json(js)
                 store = ash2txtorg_cached.AutoStore(loop, data, store_data)
             else:
                 store = await frech_fetch()

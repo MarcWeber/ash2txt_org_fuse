@@ -116,7 +116,7 @@ by reading zarr json files and use that instead.
 
 Example: find all scrolls and levels and sizes:
 ===============================================
-python example-main.py $ASH2TXT_CACHE 'https://dl.ash2txt.org' list_special_and_approximate_size_fast "full-scrolls" >| /tmp/sizes-full-scrolls
+python example-main.py $ASH2TXT_CACHE 'https://dl.ash2txt.org' list_special_and_approximate_size_fast "full-scrolls"
 Because this fetches all directory contenst its slow.
 
 It approximates the sizes by using size from HTTP responses cause fetching

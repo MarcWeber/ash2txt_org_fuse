@@ -2,6 +2,8 @@ from . import types as t
 from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Iterable
 import re
 from collections import defaultdict
+import json
+from .zarray_estimation import estimate_zarray_contents_size
 import os
 from . import ash2txtorg_cached as ac
 from pathlib import Path
@@ -94,41 +96,62 @@ async def list_special_and_approximate_size_fast(folder: t.Folder, sums_by_ext =
         fast because approximate bytes are given in directory listings found in HTML
     """
     folders, files = await folder.folders_and_files()
-    childs = []
-    path = folder.path
-    special = special_folder(folder, folders.keys(), files)
-    pe = print_each and ( special == None or print_within_special)
+
+    flines: list[str] = []
     folder_size = 0
-    items = await asyncio.gather(
-        *[ list_special_and_approximate_size_fast(v, sums_by_ext, pe, print_within_special, f"{indent}    ") for name, v in folders.items()],
-    )
+    path = folder.path
 
-    for size, lines in items:
-        folder_size += size
-        childs += lines
+    # tmp debugging
+    print(f"debug-path {path}")
 
-    sum_by_ext = defaultdict(lambda: 0)
-    counts_by_ext = defaultdict(lambda: 0)
-    for name in files:
-        r, ext = os.path.splitext(name)
-        file_size = await folder.file_size_bytes_approximate(name)
-        folder_size += file_size
+    if ".zarray" in files:
+        # don't recursie into the many folders of a folder containing a zarry file!
+        await folder.file_ensure_fetched(".zarray")
+        bytes = await folder.file_bytes(".zarray", 0, None)
+        o = json.loads(bytes.decode('utf-8'))
+        estimated_directory_size, cr, ch = estimate_zarray_contents_size(o)
+        if print_each:
+            flines.append(f"{indent}{path.name()}/ {format_size_MiB(estimated_directory_size)} {str(path)} compression hint {ch}")
+        folder_size += estimated_directory_size
 
-        if pe:
-            if sums_by_ext:
-                sum_by_ext[ext] += file_size
-                counts_by_ext[ext] += 1
-            else:
-                childs.append((f"{indent}    {name} {file_size}"))
+    else:
 
-    if pe and sums_by_ext:
-        for name, v in sum_by_ext.items():
-            childs.append(f"{indent}{ind}extension={name}: count:{counts_by_ext[name]} {format_size_MiB(v)}")
+        childs = []
+        special = special_folder(folder, folders.keys(), files)
+        pe = print_each and ( special == None or print_within_special)
+        items = await asyncio.gather(
+            *[ list_special_and_approximate_size_fast(v, sums_by_ext, pe, print_within_special, f"{indent}    ") for name, v in folders.items()],
+        )
 
-    flines = []
-    if print_each:
-        flines.append(f"{indent}{path.name()}/ {format_size_MiB(folder_size)} {str(path)}")
-        flines += childs
+        for size, lines in items:
+            folder_size += size
+            childs += lines
+
+        sum_by8_ext = defaultdict(lambda: 0)
+        counts_by_ext = defaultdict(lambda: 0)
+        for name in files:
+            r, ext = os.path.splitext(name)
+            file_size = await folder.file_size_bytes_approximate(name)
+            folder_size += file_size
+
+            if pe:
+                if sums_by_ext:
+                    sum_by_ext[ext] += file_size
+                    counts_by_ext[ext] += 1
+                else:
+                    childs.append((f"{indent}    {name} {file_size}"))
+
+        if pe and sums_by_ext:
+            for name, v in sum_by_ext.items():
+                childs.append(f"{indent}{ind}extension={name}: count:{counts_by_ext[name]} {format_size_MiB(v)}")
+
+        if print_each:
+            flines.append(f"{indent}{path.name()}/ {format_size_MiB(folder_size)} {str(path)}")
+            flines += childs
+
+    # tmp debugging
+    for x in flines:
+        print(f"debug-fline {x}")
 
     return folder_size, flines
 
